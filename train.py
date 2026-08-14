@@ -36,6 +36,7 @@ from utils.plot import save_learning_curves
 from utils.concurrency import initialize_concurrency
 from utils.loss import build_loss_from_config
 from utils.seeding import set_global_seed, seed_worker
+from utils.checkpoint import save_checkpoint as save_checkpoint_v2, load_checkpoint_for_transfer
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -59,11 +60,37 @@ val_transform = Compose([
     AsDiscreted(keys=["mask"], threshold=0.5),
 ])
 
-def save_checkpoint(model: torch.nn.Module, weight_path: str, name: str):
-    """Saves the model checkpoint."""
+def save_checkpoint(
+    model: torch.nn.Module,
+    weight_path: str,
+    name: str,
+    *,
+    train_config: dict,
+    model_type: str,
+    model_config: dict,
+    parent: Optional[str] = None,
+    shared_init_version: Optional[str] = None,
+):
+    """Saves the model checkpoint in format_version=2 (state_dict + lineage +
+    preprocess-contract metadata; see utils/checkpoint.py). Replaces the old
+    whole-object torch.save(model, path), which made partial loading
+    (encoder-only transfer) and layer freezing impossible."""
     path = os.path.join(weight_path, f"{name}.pth")
-    torch.save(model, path)
-    logger.info(f"[OK] Model saved to {path}")
+    save_checkpoint_v2(
+        model, path,
+        role=train_config.get("role", "marker_specific"),
+        model_type=model_type,
+        model_config=model_config,
+        preprocess=train_config.get("preprocess", {}),
+        marker=train_config.get("marker"),
+        task_family=train_config.get("task_family"),
+        parent=parent,
+        shared_init_version=shared_init_version,
+        contributing_markers=train_config.get("contributing_markers"),
+        n_annotated_crops=train_config.get("n_annotated_crops"),
+        seed=train_config.get("seed"),
+        in_channels=model_config.get("in_channels", 1),
+    )
 
 def train_epoch(
     model: torch.nn.Module,
@@ -291,19 +318,92 @@ def main():
     
     if model_type in full_config.get("model", {}):
         full_config["model"][model_type]["spatial_dims"] = spatial_dims
-        
+
     model = build_model_from_config(full_config)
+    model_config_used = full_config.get("model", {}).get(model_type, {})
     criterion = build_loss_from_config(full_config)
     metrics = build_metrics_from_config(full_config)
-    
+
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
 
-    # Note: If loading an existing model for fine-tuning, you would use load_checkpoint(path) here.
-    
-    optimizer = optim.AdamW(model.parameters(), lr=config.get("learning_rate", 1e-4), weight_decay=config.get("weight_decay", 1e-5))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-    
+    # ---- Fine-tuning load path (改造計劃書.md §3.2/§4.2/§4.3) ----
+    # Loads a format_version=2 shared_init/marker_specific checkpoint,
+    # enforcing the hub-and-spoke lineage rule and the preprocess contract,
+    # then drops the output head so it re-initializes for this marker/task.
+    pretrained_path = config.get("pretrained_weights")
+    parent_for_checkpoint = None
+    shared_init_version_used = None
+    if pretrained_path:
+        missing, unexpected, ckpt_meta = load_checkpoint_for_transfer(pretrained_path, model, config)
+        model.to(device)  # state_dict was loaded on CPU; re-affirm device placement
+        parent_for_checkpoint = pretrained_path
+        shared_init_version_used = ckpt_meta.get("shared_init_version")
+        logging.info(
+            f"[transfer] Fine-tuning from {pretrained_path} "
+            f"(shared_init_version={shared_init_version_used}, missing={len(missing)}, unexpected={len(unexpected)})."
+        )
+
+    # ---- Learning-rate grouping (改造計劃書.md §4.4) ----
+    # encoder_prefixes must be explicit state_dict key prefixes the user has
+    # verified against this model_type (see scripts/inspect_model_params.py)
+    # -- MONAI's UNet is a nested Sequential, so a guessed prefix would
+    # silently match nothing and this would quietly fall back to a single LR
+    # group. When encoder_prefixes isn't set (the default for existing
+    # from-scratch configs), all parameters go in one group and behavior is
+    # unchanged from before.
+    transfer_cfg = config.get("transfer", {})
+    encoder_prefixes = config.get("encoder_prefixes", [])
+    encoder_params, other_params = [], []
+    if encoder_prefixes:
+        for pname, p in model.named_parameters():
+            (encoder_params if any(pname.startswith(pfx) for pfx in encoder_prefixes) else other_params).append(p)
+        if not encoder_params:
+            logging.warning(
+                "encoder_prefixes did not match any parameter names -- falling back to a single "
+                "LR group for all parameters. Run scripts/inspect_model_params.py to get the real "
+                "prefixes for this model_type before relying on encoder_lr_scale/staged unfreezing."
+            )
+            other_params = list(model.parameters())
+    else:
+        other_params = list(model.parameters())
+
+    base_lr = config.get("learning_rate", 1e-4)
+    default_encoder_scale = 0.1 if pretrained_path else 1.0
+    encoder_lr_scale = transfer_cfg.get("encoder_lr_scale", default_encoder_scale)
+
+    if encoder_params:
+        optimizer = optim.AdamW([
+            {"params": encoder_params, "lr": base_lr * encoder_lr_scale, "name": "encoder"},
+            {"params": other_params, "lr": base_lr, "name": "other"},
+        ], weight_decay=config.get("weight_decay", 1e-5))
+    else:
+        optimizer = optim.AdamW(other_params, lr=base_lr, weight_decay=config.get("weight_decay", 1e-5))
+
+    # ---- Staged unfreeze schedule (改造計劃書.md §4.3) ----
+    # Only engages when fine-tuning from a checkpoint AND encoder params were
+    # actually identified -- from-scratch training keeps the original
+    # ReduceLROnPlateau behavior untouched. Skipping phase 1 (frozen encoder)
+    # is the most common way transfer learning "doesn't work": the freshly
+    # random head produces large gradients on the first few batches that
+    # wash out the pretrained encoder features before the head has aligned
+    # to them at all.
+    total_epochs = config.get("training_epochs", 30)
+    use_staged_transfer = bool(pretrained_path) and bool(encoder_params)
+    if use_staged_transfer:
+        freeze_epochs = transfer_cfg.get("freeze_epochs", 20)
+        finetune_epochs = transfer_cfg.get("finetune_epochs", 60)
+        warmup_epochs = max(1, transfer_cfg.get("warmup_epochs", 5))
+        phase_lrs = transfer_cfg.get("phase_lrs", [1e-3, 1e-4, 1e-5])
+        scheduler = None  # LR is driven manually per-epoch below instead of ReduceLROnPlateau
+        logging.info(
+            f"[transfer] Staged unfreeze: phase1 (encoder frozen) epoch<{freeze_epochs}, "
+            f"phase2 (encoder lr x{encoder_lr_scale}) epoch<{freeze_epochs + finetune_epochs}, "
+            f"phase3 (full network, lower lr) after. warmup_epochs={warmup_epochs}, phase_lrs={phase_lrs}."
+        )
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
     history: Dict[str, Dict[str, List[float]]] = {n: {"train": [], "val": []} for n in list(metrics.keys()) + ["loss"]}
     best_val_loss = float("inf")
 
@@ -318,7 +418,32 @@ def main():
     
     for epoch in range(config.get("training_epochs", 30)):
         print("\n"); logger.info(f"Epoch {epoch + 1}")
-        
+
+        if use_staged_transfer:
+            if epoch < freeze_epochs:
+                phase = 1
+            elif epoch < freeze_epochs + finetune_epochs:
+                phase = 2
+            else:
+                phase = 3
+            phase_lr = phase_lrs[min(phase - 1, len(phase_lrs) - 1)]
+
+            for p in encoder_params:
+                p.requires_grad = (phase != 1)
+
+            if epoch < warmup_epochs:
+                lr_mult = (epoch + 1) / warmup_epochs
+            else:
+                cosine_progress = min(1.0, (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs))
+                lr_mult = 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * cosine_progress))
+
+            for group in optimizer.param_groups:
+                scale = encoder_lr_scale if group.get("name") == "encoder" else 1.0
+                group["lr"] = phase_lr * scale * lr_mult
+
+            if epoch in (0, freeze_epochs, freeze_epochs + finetune_epochs):
+                logger.info(f"[transfer] Epoch {epoch + 1}: entering phase {phase} (encoder frozen={phase == 1}, phase_lr={phase_lr}).")
+
         # Calculate heavy metrics only on interval epochs
         is_metric_epoch = (epoch + 1) % metric_interval == 0
         curr_metrics = metrics if is_metric_epoch else {}
@@ -363,13 +488,18 @@ def main():
 
         val_avg_loss = val_results["loss"]
 
-        scheduler.step(val_avg_loss)
+        if scheduler is not None:
+            scheduler.step(val_avg_loss)
+        checkpoint_kwargs = dict(
+            train_config=config, model_type=model_type, model_config=model_config_used,
+            parent=parent_for_checkpoint, shared_init_version=shared_init_version_used,
+        )
         if val_avg_loss < best_val_loss:
-            best_val_loss = val_avg_loss; save_checkpoint(model, weight_path, model_name)
-        
+            best_val_loss = val_avg_loss; save_checkpoint(model, weight_path, model_name, **checkpoint_kwargs)
+
         if (epoch + 1) % 25 == 0:
-            save_checkpoint(model, weight_path, f"{model_name}_epoch_{epoch+1}")
-            
+            save_checkpoint(model, weight_path, f"{model_name}_epoch_{epoch+1}", **checkpoint_kwargs)
+
         save_learning_curves(history, artifact_path, model_name)
 
     logging.info("Training complete.")

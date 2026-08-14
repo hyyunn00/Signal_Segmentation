@@ -33,17 +33,50 @@ from utils.cropper import compute_z_plan
 from utils.stitcher import stitch_image
 from utils.visualization import visualize_predictions
 from utils.concurrency import initialize_concurrency
+from utils.checkpoint import load_checkpoint_for_inference
 
 # Standard transform
 inference_transform = Compose([
     ToTensord(keys=["image"], dtype=torch.float32),
 ])
 
-def load_checkpoint(model_path: str):
-    """Load a torch model checkpoint."""
+def load_checkpoint(model_path: str, inference_preprocess: dict = None) -> torch.nn.Module:
+    """Load a model checkpoint, supporting both formats:
+      - format_version=2 (state_dict + metadata; utils/checkpoint.py) --
+        rebuilt via build_model_from_config from the stored model_type/
+        model_config and loaded strictly.
+      - legacy whole-object checkpoints (torch.save(model, path)) -- loaded
+        as-is for backward compatibility with weights trained before this
+        change. Emits a deprecation warning; convert with
+        scripts/convert_legacy_checkpoint.py to get lineage tracking and
+        partial-loading support for future fine-tuning.
+
+    inference_preprocess (full_config["inference"]["preprocess"]), if given,
+    is compared against the checkpoint's stored preprocess contract when
+    available. Mismatches are logged as a warning rather than raised --
+    unlike training's hard-fail, this is a production batch job where an
+    operator should be alerted but not have an in-progress run aborted.
+    """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    return torch.load(model_path, weights_only=False)
+
+    raw = torch.load(model_path, map_location="cpu", weights_only=False)
+    if isinstance(raw, dict) and "state_dict" in raw:
+        if inference_preprocess is not None:
+            ckpt_preprocess = raw.get("preprocess")
+            if ckpt_preprocess != inference_preprocess:
+                logging.warning(
+                    f"preprocess mismatch between checkpoint and inference config -- results may "
+                    f"be degraded by a different normalization pipeline than the one this model "
+                    f"was trained with.\n  checkpoint: {ckpt_preprocess}\n  config:     {inference_preprocess}"
+                )
+        return load_checkpoint_for_inference(model_path, map_location="cpu")
+
+    logging.warning(
+        f"{model_path} is a legacy whole-object checkpoint (no lineage/preprocess metadata). "
+        f"Convert it with scripts/convert_legacy_checkpoint.py to get format_version=2 benefits."
+    )
+    return raw
 
 def run_inference(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> np.ndarray:
     """Execute model inference on a dataloader. Returns (N, D, H, W)."""
@@ -317,7 +350,7 @@ def main():
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     logging.info(f"Loading model: {model_path}")
-    model = load_checkpoint(model_path).to(device)
+    model = load_checkpoint(model_path, inference_preprocess=config.get("preprocess")).to(device)
     
     volumes_to_process = []
     if root_input.name == input_name:

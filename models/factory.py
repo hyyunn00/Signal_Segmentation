@@ -2,11 +2,12 @@ from .UNet import UNet
 from .AttentionUNet import AttentionUNet
 from .SwinUNETR import SwinUNETR
 from .VNet import VNet
+from utils.norm_utils import enforce_instance_norm
 
 def build_model_from_config(config):
     """
     Factory function to create models from a configuration dictionary.
-    
+
     If config is the full config, it extracts model_type from the 'train' section
     and parameters from the 'model' section. Otherwise, it assumes model_type
     is directly in the config.
@@ -21,7 +22,7 @@ def build_model_from_config(config):
         model_params = config
 
     if model_type == "unet":
-        return UNet(
+        model = UNet(
             spatial_dims=model_params.get("spatial_dims", 3),
             in_channels=model_params.get("in_channels", 1),
             out_channels=model_params.get("out_channels", 1),
@@ -30,9 +31,9 @@ def build_model_from_config(config):
             num_res_units=model_params.get("num_res_units", 2),
             dropout=model_params.get("dropout", 0.1)
         )
-    
+
     elif model_type == "attention_unet":
-        return AttentionUNet(
+        model = AttentionUNet(
             spatial_dims=model_params.get("spatial_dims", 3),
             in_channels=model_params.get("in_channels", 1),
             out_channels=model_params.get("out_channels", 1),
@@ -40,23 +41,30 @@ def build_model_from_config(config):
             strides=model_params.get("strides", (2, 2, 2, 2)),
             dropout=model_params.get("dropout", 0.1)
         )
-        
+
     elif model_type == "swin_unetr":
-        return SwinUNETR(
+        model = SwinUNETR(
             in_channels=model_params.get("in_channels", 1),
             out_channels=model_params.get("out_channels", 1),
             feature_size=model_params.get("feature_size", 48),
             use_checkpoint=model_params.get("use_checkpoint", False),
             spatial_dims=model_params.get("spatial_dims", 3)
         )
-    
+
     elif model_type == "vnet":
-        return VNet(
+        model = VNet(
             spatial_dims=model_params.get("spatial_dims", 3),
             in_channels=model_params.get("in_channels", 1),
             out_channels=model_params.get("out_channels", 1),
             dropout_prob=model_params.get("dropout_prob", 0.5),
         )
-        
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
+
+    # Cross-marker transfer requires InstanceNorm (no batch-level statistics
+    # baked in from the source dataset) -- see utils/norm_utils.py. Applied
+    # uniformly here instead of trusting each architecture's current MONAI
+    # default, since VNet hardcodes BatchNorm3d with no constructor option
+    # to disable it.
+    return enforce_instance_norm(model)

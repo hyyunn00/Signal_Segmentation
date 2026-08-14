@@ -9,3 +9,12 @@ matplotlib
 monai
 scikit-learn
 scikit-image
+# Directly imported (train.py, analysis.py, analysis3d.py, utils/metrics.py)
+# but previously missing from this list -- torch/scipy happened to still get
+# installed transitively via monai/scikit-image, tifffile did not (改造計劃書.md
+# §3.6 dependency-risk note). Not version-pinned here: no reliable record of
+# which exact versions this codebase has actually been tested against: pin
+# these once that's established from the real training environment.
+torch
+scipy
+tifffile

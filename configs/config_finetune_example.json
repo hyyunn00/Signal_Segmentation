@@ -1,0 +1,128 @@
+{
+  "description": "Example fine-tuning config (改造計劃書.md §4). NOT a production config -- paths are placeholders. Demonstrates the fields a fine-tuning run needs on top of a normal training config (see configs/config_cell.json for the base). encoder_prefixes/head_prefixes below are ILLUSTRATIVE ONLY: run `python scripts/inspect_model_params.py --config configs/config_finetune_example.json` first and replace them with the real parameter name prefixes for your model_type before actually using this config -- a wrong prefix matches 0 parameters and silently falls back to a single LR group (see train.py's warning).",
+  "resources": {
+    "numba_threads": 16,
+    "dask_threads": 16,
+    "io_workers": 8,
+    "metrics_workers": 16,
+    "memory_limit": 64
+  },
+  "normalization": {
+    "description": "Registry of available intensity normalization methods.",
+    "z-score": { "std_multiplier": 1.0 },
+    "min-max": {},
+    "histogram": { "bins": 1024 },
+    "min-max-gamma": { "gamma": 2.2 }
+  },
+  "outputs": {
+    "description": "Registry of global defaults for each output format.",
+    "zarr": { "chunk_size": [128, 128, 128] },
+    "ome-zarr": { "n_level": 5, "resize_factor": 2, "chunk_size": [128, 128, 128] },
+    "scroll-tiff": { "axis": 1 },
+    "single-tiff": {}
+  },
+  "model": {
+    "description": "Registry of available model architectures and their default parameters.",
+    "unet": {
+      "spatial_dims": 3,
+      "in_channels": 1,
+      "out_channels": 1,
+      "channels": [32, 64, 128, 256, 512],
+      "strides": [2, 2, 2, 2],
+      "num_res_units": 2,
+      "dropout": 0.1
+    }
+  },
+  "loss": {
+    "description": "Registry of available loss functions and their default parameters.",
+    "dice": { "smooth": 1e-06 },
+    "focal": { "alpha": 0.8, "gamma": 2.0 }
+  },
+  "metrics": {
+    "description": "Registry of available metrics and their default parameters.",
+    "dice_soft": { "smooth": 1e-05 },
+    "dice_hard": { "smooth": 1e-05 },
+    "iou": { "smooth": 1e-05 }
+  },
+  "train": {
+    "device": "cuda:0",
+    "data_path": ["/path/to/new-marker/training-data"],
+    "save_path": "/path/to/output/new-marker",
+    "model_name": "new_marker_v0_finetune",
+    "model_type": "unet",
+    "input_name": "images",
+    "mask_name": "images_mask",
+
+    "preprocess": {
+      "normalize_mode": "z-score",
+      "pad_mode": "reflect",
+      "sample_rate": 1.0,
+      "low_cut": null,
+      "high_cut": null
+    },
+
+    "pretrained_weights": "/path/to/output/shared_init/weights/shared_init_v1.pth",
+    "allow_chained_transfer": false,
+
+    "reset_head": true,
+    "head_prefixes": [
+      "model.model.2."
+    ],
+    "encoder_prefixes": [
+      "model.model.0.",
+      "model.model.1."
+    ],
+    "encoder_keep_prefixes": null,
+
+    "role": "marker_specific",
+    "marker": "NewMarkerName",
+    "task_family": "blob",
+    "contributing_markers": null,
+    "n_annotated_crops": 8,
+
+    "transfer": {
+      "description": "Staged unfreeze schedule (改造計劃書.md §4.3): phase1 (encoder frozen) for freeze_epochs, phase2 (encoder unfrozen at encoder_lr_scale x phase_lrs[1]) for finetune_epochs, phase3 (full network at phase_lrs[2]) for the remainder of training_epochs. Only takes effect because pretrained_weights is set above.",
+      "freeze_epochs": 20,
+      "finetune_epochs": 60,
+      "warmup_epochs": 5,
+      "phase_lrs": [1e-3, 1e-4, 1e-5],
+      "encoder_lr_scale": 0.1
+    },
+
+    "loss": { "dice": 1, "focal": 0.2 },
+    "metrics": ["dice_soft", "dice_hard", "iou"],
+    "metric_interval": 1,
+    "val_ratio": 0.2,
+    "seed": 42,
+    "deterministic": true,
+    "training_epochs": 110,
+    "training_batch_size": 8,
+    "training_num_workers": 8,
+    "training_patch_size": [64, 64, 64],
+    "training_overlay": [0, 0, 0],
+    "training_neg_keep_ratio": 1.0,
+    "training_resize_factor": [1.0, 1.0, 1.0],
+    "learning_rate": 0.0001,
+    "visualize_preview": true
+  },
+  "inference": {
+    "device": "cuda:0",
+    "input_path": "/path/to/new-marker/inference-data",
+    "output_path": "/path/to/new-marker/inference-data",
+    "input_name": "images",
+    "output_name": "images_mask_finetuned",
+    "preprocess": {
+      "normalize_mode": "z-score",
+      "pad_mode": "reflect",
+      "sample_rate": 1.0,
+      "low_cut": null,
+      "high_cut": null
+    },
+    "model_path": "/path/to/output/new-marker/weights/new_marker_v0_finetune.pth",
+    "batch_size": 16,
+    "inference_patch_size": [64, 64, 64],
+    "inference_overlay": [16, 16, 16],
+    "inference_resize_factor": [1.0, 1.0, 1.0],
+    "output": { "type": "Scroll-Tiff", "dtype": "uint16", "resize_order": 0 }
+  }
+}
