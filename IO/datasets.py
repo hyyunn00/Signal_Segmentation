@@ -38,13 +38,21 @@ def _pad_image(data: np.ndarray, pad_width, mode: str, fill: float = 0.0) -> np.
 @dataclass(frozen=True)
 class PatchMetadata:
     """Metadata for a single patch.
-    
+
     If is_patch_mode=True: volume_idx is the index into the flattened patch tensor.
-    If is_patch_mode=False: volume_idx is the index into the image_tensors list, 
+    If is_patch_mode=False: volume_idx is the index into the image_tensors list,
                             and slices defines the crop.
+    source_volume: index of the source training volume this patch was extracted
+                   from (in the order volumes were discovered/sorted). Used by
+                   split() to perform a volume-level (rather than patch-level)
+                   train/val split, so that no two spatially-overlapping
+                   patches from the same volume end up on both sides of the
+                   split (改造計劃書.md §3.3). -1 means "unknown" (e.g.
+                   inference patches, which don't need this).
     """
     volume_idx: int
     slices: Optional[PatchSlice] = None
+    source_volume: int = -1
 
 class BaseMicroscopyDataset(Dataset):
     def __init__(
@@ -125,7 +133,8 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
 
         all_image_patches = []
         all_mask_patches = []
-        
+        all_volume_ids = []  # tracks which source volume each appended patch batch came from
+
         image_roots = [image_root] if isinstance(image_root, str) else image_root
         mask_roots = [mask_root] if isinstance(mask_root, str) else mask_root
         
@@ -158,7 +167,7 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
                     if m_path.exists() and m_path.is_dir():
                         volumes_found.append((p, m_path))
 
-        for img_path, msk_path in sorted(volumes_found):
+        for vol_idx, (img_path, msk_path) in enumerate(sorted(volumes_found)):
             v_display_name = f"{img_path.parent.name}/{img_path.name}"
             
             img_reader = FileReader(
@@ -207,18 +216,20 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
             # Convert to torch and add channel dimension: (N, D, H, W) -> (N, 1, D, H, W)
             all_image_patches.append(torch.from_numpy(img_patches).unsqueeze(1))
             all_mask_patches.append(torch.from_numpy(msk_patches).unsqueeze(1))
-            
+            all_volume_ids.extend([vol_idx] * len(filtered))
+
             logger.info(f"Volume {v_display_name}: Extracted {len(filtered)} patches.")
-            
+
         if not all_image_patches:
             raise RuntimeError(f"No valid patches were extracted from {image_root}")
 
         image_stack = torch.cat(all_image_patches).share_memory_()
         mask_stack = torch.cat(all_mask_patches).share_memory_()
-        
+
         # patch_indices should be for the final total number of patches
-        patch_indices = [PatchMetadata(volume_idx=i) for i in range(len(image_stack))]
-        
+        assert len(all_volume_ids) == len(image_stack), "volume id tracking got out of sync with patch stack"
+        patch_indices = [PatchMetadata(volume_idx=i, source_volume=all_volume_ids[i]) for i in range(len(image_stack))]
+
         return cls(
             image_tensors=[image_stack],
             mask_tensors=[mask_stack],
@@ -228,22 +239,63 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
         )
 
     def split(
-        self, 
-        val_ratio: float = 0.2, 
+        self,
+        val_ratio: float = 0.2,
         seed: int = 42,
         train_transform: Optional[Callable] = None,
         val_transform: Optional[Callable] = None
     ) -> tuple[TrainMicroscopyDataset, TrainMicroscopyDataset]:
-        """Splits indices while keeping the underlying shared tensors identical."""
+        """Splits by source volume, not by individual patch index.
+
+        Patches are sampled from a grid with overlapping/adjacent candidate
+        positions within each volume, so a naive patch-level shuffle risks
+        spatially-close (or overlapping) patches from the *same* volume
+        landing on both sides of the split -- inflating validation metrics
+        and biasing model selection (best-checkpoint-by-val-loss) toward
+        overfit-friendly checkpoints (改造計劃書.md §3.3). Splitting by whole
+        volume guarantees every val patch comes from a volume the model
+        never saw any patch of during training.
+        """
         n = len(self.patch_indices)
-        indices = np.arange(n)
-        rng = np.random.default_rng(seed)
-        rng.shuffle(indices)
-        
-        val_n = int(n * val_ratio)
-        val_idx = indices[:val_n]
-        train_idx = indices[val_n:]
-        
+        volume_ids = np.array([p.source_volume for p in self.patch_indices])
+        unique_volumes = np.unique(volume_ids)
+
+        if len(unique_volumes) < 2 or np.any(volume_ids < 0):
+            # Not enough distinct volumes (or source_volume wasn't tracked,
+            # e.g. legacy patch_indices) to do a volume-level split safely.
+            # Fall back to the old patch-level shuffle, but warn loudly so
+            # this doesn't silently reintroduce the leakage risk.
+            logger.warning(
+                "split(): could not perform a volume-level split (found %d distinct source "
+                "volume(s), or source_volume metadata missing) -- falling back to patch-level "
+                "shuffling. Validation metrics from this run should be treated as potentially "
+                "optimistic (see split() docstring).",
+                len(unique_volumes),
+            )
+            indices = np.arange(n)
+            rng = np.random.default_rng(seed)
+            rng.shuffle(indices)
+            val_n = int(n * val_ratio)
+            val_idx = indices[:val_n]
+            train_idx = indices[val_n:]
+        else:
+            rng = np.random.default_rng(seed)
+            shuffled_volumes = unique_volumes.copy()
+            rng.shuffle(shuffled_volumes)
+
+            val_n_volumes = max(1, round(len(shuffled_volumes) * val_ratio))
+            val_n_volumes = min(val_n_volumes, len(shuffled_volumes) - 1)  # always leave >=1 volume for train
+            val_volumes = set(shuffled_volumes[:val_n_volumes].tolist())
+
+            val_idx = np.array([i for i in range(n) if volume_ids[i] in val_volumes])
+            train_idx = np.array([i for i in range(n) if volume_ids[i] not in val_volumes])
+
+            logger.info(
+                "split(): volume-level split -> %d/%d volumes held out for val "
+                "(%d/%d patches val/train).",
+                val_n_volumes, len(shuffled_volumes), len(val_idx), len(train_idx),
+            )
+
         train_ds = TrainMicroscopyDataset(
             image_tensors=self.image_tensors,
             mask_tensors=self.mask_tensors,

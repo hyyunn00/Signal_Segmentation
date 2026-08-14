@@ -41,27 +41,39 @@ def list_files(path: Path, exts: Tuple[str, ...] = VALID_EXTS) -> List[Path]:
 def to_binary(arr: np.ndarray) -> np.ndarray:
     return (arr > 0).astype(np.uint8)
 
-def write_results(rows: List[Dict[str, object]], summary_rows: List[Dict[str, object]], out_path: Path):
+def write_results(
+    rows: List[Dict[str, object]],
+    summary_rows: List[Dict[str, object]],
+    out_path: Path,
+    detailed_headers: List[str] = DETAILED_HEADERS,
+    summary_headers: List[str] = SUMMARY_HEADERS,
+):
+    """Writes detailed + summary rows to xlsx (or csv fallback).
+
+    detailed_headers/summary_headers are overridable so callers with a
+    different metric schema (e.g. analysis3d.py's 2D-vs-3D diagnostic
+    columns) can reuse this writer instead of re-implementing it.
+    """
     try:
         import openpyxl
         from openpyxl import Workbook
         wb = Workbook()
         ws_sum = wb.active
         ws_sum.title = "Model Summary"
-        ws_sum.append(SUMMARY_HEADERS)
-        for r in summary_rows: ws_sum.append([r.get(k, 0) for k in SUMMARY_HEADERS])
+        ws_sum.append(summary_headers)
+        for r in summary_rows: ws_sum.append([r.get(k, 0) for k in summary_headers])
         ws_det = wb.create_sheet("Detailed Evaluation")
-        ws_det.append(DETAILED_HEADERS)
-        for r in rows: ws_det.append([r.get(k, 0) for k in DETAILED_HEADERS])
+        ws_det.append(detailed_headers)
+        for r in rows: ws_det.append([r.get(k, 0) for k in detailed_headers])
         wb.save(str(out_path.with_suffix(".xlsx")))
         logger.info(f"Results saved to {out_path.with_suffix('.xlsx')}")
     except ImportError:
         import csv
         csv_path = out_path.with_suffix(".csv")
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=SUMMARY_HEADERS)
+            w = csv.DictWriter(f, fieldnames=summary_headers)
             w.writeheader()
-            for r in rows: w.writerow({k: r.get(k) for k in SUMMARY_HEADERS})
+            for r in rows: w.writerow({k: r.get(k) for k in summary_headers})
         logger.info(f"Detailed results saved to {csv_path}")
 
 def evaluate_triplet(gt_dir: Path, pred_dir: Path, metric_cfg: dict = None) -> Dict[str, float]:
@@ -136,6 +148,56 @@ def evaluate_triplet(gt_dir: Path, pred_dir: Path, metric_cfg: dict = None) -> D
     
     return metrics
 
+def discover_triplets(root: Path) -> List[Tuple[Path, Path, str, Path]]:
+    """Finds (gt_dir, img_dir, model_name, pred_dir) tuples under root.
+
+    Extracted out of main() so other entry points (e.g. analysis3d.py) can
+    reuse the same folder-discovery/model-name-parsing rules instead of
+    re-implementing them -- discovery behavior is unchanged from before.
+    """
+    triplets: List[Tuple[Path, Path, str, Path]] = []
+
+    # 1. Find potential GT folders (ending in _mask and NOT .scroll-tif)
+    gt_folders = [
+        p for p in root.rglob("*_mask")
+        if p.is_dir() and not p.name.endswith(".scroll-tif")
+    ]
+
+    for gt_dir in gt_folders:
+        parent = gt_dir.parent
+        # The image folder is the one that shares the same prefix as the mask folder
+        # e.g. Flatten_561_mask -> Flatten_561
+        img_folder_name = gt_dir.name.replace("_mask", "")
+        img_dir = parent / img_folder_name
+
+        if not img_dir.exists() or not img_dir.is_dir():
+            # Fallback: find ANY other folder in parent that isn't a mask or scroll-tif
+            other_dirs = [d for d in parent.iterdir() if d.is_dir() and d != gt_dir and "_mask" not in d.name]
+            if other_dirs: img_dir = other_dirs[0]
+            else: continue
+
+        # 2. Find prediction folders in the same parent
+        # They should contain the model name and end with .scroll-tif
+        pred_folders = [
+            p for p in parent.iterdir()
+            if p.is_dir() and p.name.strip().endswith(".scroll-tif")
+        ]
+
+        for p_dir in pred_folders:
+            p_name = p_dir.name.strip()
+            # Try to extract model name: {img_name}_{model}_mask.scroll-tif
+            # Robust extraction using regex
+            model_match = re.search(f"{img_dir.name}_(.*)_mask", p_name)
+            if model_match:
+                model_name = model_match.group(1)
+            else:
+                # Fallback: just remove prefix and suffix
+                model_name = p_name.replace(img_dir.name, "").replace("_mask.scroll-tif", "").strip("_")
+
+            triplets.append((gt_dir, img_dir, model_name, p_dir))
+
+    return triplets
+
 def main():
     parser = argparse.ArgumentParser(description="Robustly evaluate masks.")
     parser.add_argument("--base_dir", type=str, required=True, help="Root directory to search")
@@ -155,53 +217,19 @@ def main():
     root = Path(args.base_dir).resolve()
     all_results = []
 
-    # 1. Find potential GT folders (ending in _mask and NOT .scroll-tif)
-    gt_folders = [
-        p for p in root.rglob("*_mask") 
-        if p.is_dir() and not p.name.endswith(".scroll-tif")
-    ]
-    
-    logger.info(f"Found {len(gt_folders)} GT volumes to analyze.")
+    triplets = discover_triplets(root)
+    logger.info(f"Found {len(triplets)} GT/prediction pairs to analyze.")
 
-    for gt_dir in tqdm(gt_folders, desc="GT Folders"):
+    for gt_dir, img_dir, model_name, p_dir in tqdm(triplets, desc="Evaluating"):
         parent = gt_dir.parent
-        # The image folder is the one that shares the same prefix as the mask folder
-        # e.g. Flatten_561_mask -> Flatten_561
-        img_folder_name = gt_dir.name.replace("_mask", "")
-        img_dir = parent / img_folder_name
-        
-        if not img_dir.exists() or not img_dir.is_dir():
-            # Fallback: find ANY other folder in parent that isn't a mask or scroll-tif
-            other_dirs = [d for d in parent.iterdir() if d.is_dir() and d != gt_dir and "_mask" not in d.name]
-            if other_dirs: img_dir = other_dirs[0]
-            else: continue
-
-        # 2. Find prediction folders in the same parent
-        # They should contain the model name and end with .scroll-tif
-        pred_folders = [
-            p for p in parent.iterdir() 
-            if p.is_dir() and p.name.strip().endswith(".scroll-tif")
-        ]
-        
-        for p_dir in pred_folders:
-            p_name = p_dir.name.strip()
-            # Try to extract model name: {img_name}_{model}_mask.scroll-tif
-            # Robust extraction using regex
-            model_match = re.search(f"{img_dir.name}_(.*)_mask", p_name)
-            if model_match:
-                model_name = model_match.group(1)
-            else:
-                # Fallback: just remove prefix and suffix
-                model_name = p_name.replace(img_dir.name, "").replace("_mask.scroll-tif", "").strip("_")
-            
-            metrics = evaluate_triplet(gt_dir, p_dir, metric_cfg=metric_cfg)
-            if metrics["files_evaluated"] > 0:
-                all_results.append({
-                    "parent_folder": parent.name,
-                    "image_folder": img_dir.name,
-                    "model_name": model_name,
-                    **metrics
-                })
+        metrics = evaluate_triplet(gt_dir, p_dir, metric_cfg=metric_cfg)
+        if metrics["files_evaluated"] > 0:
+            all_results.append({
+                "parent_folder": parent.name,
+                "image_folder": img_dir.name,
+                "model_name": model_name,
+                **metrics
+            })
 
     if not all_results:
         logger.warning("No matching GT/Prediction pairs found."); return

@@ -35,6 +35,7 @@ from utils.metrics import build_metrics_from_config
 from utils.plot import save_learning_curves
 from utils.concurrency import initialize_concurrency
 from utils.loss import build_loss_from_config
+from utils.seeding import set_global_seed, seed_worker
 
 # Initialize logging
 logger = logging.getLogger(__name__)
@@ -113,7 +114,8 @@ def train_epoch(
                 val = float(v.item()) if isinstance(v, torch.Tensor) else float(v)
                 current_metrics[name] = val
                 metric_sums[name] += val
-            except Exception: pass
+            except Exception as e:
+                logger.warning(f"Metric '{name}' failed on this batch: {e}")
 
         progress.set_postfix({k: f"{v:.4f}" for k, v in current_metrics.items()})
 
@@ -168,8 +170,9 @@ def valid_epoch(
                     val = float(v.item()) if isinstance(v, torch.Tensor) else float(v)
                     current_metrics[name] = val
                     metric_sums[name] += val
-                except Exception: pass
-            
+                except Exception as e:
+                    logger.warning(f"Metric '{name}' failed on this batch: {e}")
+
             if is_viz_epoch and viz_cache:
                 current_count = len(viz_cache["images"])
                 if current_count < cache_size:
@@ -207,7 +210,14 @@ def main():
         
     config = full_config.get("train", {})
     model_config = full_config.get("model", {})
-    
+
+    # Seed every RNG (python/numpy/torch) before any dataset construction or
+    # model init happens, so a config produces the same result run-to-run.
+    # See utils/seeding.py for why this must happen before
+    # build_train_dataset_from_config() specifically.
+    seed = config.get("seed", 42)
+    set_global_seed(seed, deterministic=config.get("deterministic", False))
+
     img_root, mask_root = config.get("img_path"), config.get("mask_path")
     data_root = config.get("data_path")
     save_root = config.get("save_path")
@@ -254,21 +264,25 @@ def main():
         visualize_dataset(train_ds, title="train_samples_preview", save_path=viz_path)
         visualize_dataset(val_ds, title="validation_samples_preview", save_path=viz_path)
     
+    loader_generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
-        train_ds, 
-        batch_size=config.get("training_batch_size", 8), 
-        shuffle=True, 
-        num_workers=config.get("training_num_workers", 4), 
-        persistent_workers=True,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_ds, 
-        batch_size=config.get("training_batch_size", 8), 
-        shuffle=False, 
+        train_ds,
+        batch_size=config.get("training_batch_size", 8),
+        shuffle=True,
         num_workers=config.get("training_num_workers", 4),
         persistent_workers=True,
-        pin_memory=True
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+        generator=loader_generator
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=config.get("training_batch_size", 8),
+        shuffle=False,
+        num_workers=config.get("training_num_workers", 4),
+        persistent_workers=True,
+        pin_memory=True,
+        worker_init_fn=seed_worker
     )
     
     # Model
