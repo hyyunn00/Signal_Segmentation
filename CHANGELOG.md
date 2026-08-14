@@ -1,6 +1,6 @@
 # CHANGELOG
 
-記錄本專案（`Signal_Segmentation`）相對於原始碼來源 `Chulab-Signal_Segmentation-main`（快照複製，無 git 歷史）的所有改動。每一項改動都依照 [改造計劃書.md](./改造計劃書.md) 的稽核結果進行，格式為：**改動** / **原因** / **效果**。
+記錄本專案（`Signal_Segmentation`）相對於原始碼來源 `Chulab-Signal_Segmentation-main`（快照複製，無 git 歷史）的所有改動。每一項改動都依照 [改造計劃書.md](./notes/IMPROVEMENT_PLAN.md) 的稽核結果進行，格式為：**改動** / **原因** / **效果**。
 
 基準版本：`72642d2` "Import baseline from Chulab-Signal_Segmentation-main snapshot"（未經任何修改的原始碼複製）。
 
