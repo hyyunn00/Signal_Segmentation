@@ -177,10 +177,10 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
                 stats_sample_rate=sample_rate,
                 low_cut=low_cut,
                 high_cut=high_cut,
-                compute_histogram=(method == "histogram")
+                compute_histogram=(method in ("histogram", "percentile"))
             )
             img_data = img_reader.read(out_dtype=np.float32)
-            
+
             # Read mask data
             msk_reader = FileReader(msk_path, io_workers=io_workers)
             msk_data = msk_reader.read(out_dtype=np.float32)
@@ -189,9 +189,13 @@ class TrainMicroscopyDataset(BaseMicroscopyDataset):
             vol_pad = _volume_pad_widths(img_data.shape, patch_size)
             if any(before + after > 0 for before, after in vol_pad):
                 padded_shape = tuple(img_data.shape[i] + vol_pad[i][0] + vol_pad[i][1] for i in range(3))
-                logger.info(f"Volume {img_path.parent.name}: Padded {img_data.shape} -> {padded_shape} (mode={pad_mode})")
+                logger.info(f"Volume {img_path.parent.name}: Padded {img_data.shape} -> {padded_shape} (image mode={pad_mode}, mask mode=constant)")
                 img_data = _pad_image(img_data, vol_pad, pad_mode, fill=0.0)
-                msk_data = _pad_image(msk_data, vol_pad, pad_mode, fill=0.0)
+                # Masks always use constant/zero padding, regardless of the
+                # image's pad_mode. Reflect-padding a mask mirrors any
+                # boundary object across the volume edge, manufacturing a
+                # duplicate object that inflates counts (改造計劃書.md §6.5).
+                msk_data = _pad_image(msk_data, vol_pad, "constant", fill=0.0)
 
 
             # Apply Normalization

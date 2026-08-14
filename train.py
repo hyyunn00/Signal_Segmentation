@@ -18,14 +18,6 @@ import numpy as np
 from tqdm import tqdm
 from typing import Dict, List, Optional, Callable, Union
 
-from monai.transforms.compose import Compose
-from monai.transforms.utility.dictionary import ToTensord
-from monai.transforms.spatial.dictionary import RandFlipd
-from monai.transforms.intensity.dictionary import (
-    GaussianSmoothd, NormalizeIntensityd, RandAdjustContrastd, RandBiasFieldd, 
-    RandShiftIntensityd, RandScaleIntensityd, RandGaussianNoised
-)
-from monai.transforms.post.dictionary import AsDiscreted
 from monai.data.dataloader import DataLoader
 
 from IO import build_train_dataset_from_config
@@ -37,28 +29,10 @@ from utils.concurrency import initialize_concurrency
 from utils.loss import build_loss_from_config
 from utils.seeding import set_global_seed, seed_worker
 from utils.checkpoint import save_checkpoint as save_checkpoint_v2, load_checkpoint_for_transfer
+from utils.transforms import build_train_transform, build_val_transform
 
 # Initialize logging
 logger = logging.getLogger(__name__)
-
-# Transforms
-train_transform = Compose([
-    ToTensord(keys=["image", "mask"], dtype=torch.float32),
-    # GaussianSmoothd(keys=["mask"], sigma=0.1),
-    AsDiscreted(keys=["mask"], threshold=0.5),
-    RandFlipd(keys=["image", "mask"], spatial_axis=1, prob=0.5),
-    RandAdjustContrastd(keys=["image"], prob=0.3),
-    # RandGaussianNoised(keys=["image"], prob=0.4, mean=0.0, std=0.1),
-    RandBiasFieldd(keys=["image"], prob=0.2),
-    RandShiftIntensityd(keys=["image"], offsets=0.2, prob=0.3),
-    RandScaleIntensityd(keys=["image"], factors=0.2, prob=0.3),
-])
-
-val_transform = Compose([
-    ToTensord(keys=["image", "mask"], dtype=torch.float32),
-    # GaussianSmoothd(keys=["mask"], sigma=0.1),
-    AsDiscreted(keys=["mask"], threshold=0.5),
-])
 
 def save_checkpoint(
     model: torch.nn.Module,
@@ -283,6 +257,12 @@ def main():
         model_src = os.path.join("models", model_source_map[model_type])
         if os.path.exists(model_src):
             shutil.copy2(model_src, os.path.join(artifact_path, model_source_map[model_type]))
+
+    # Transforms: config-driven (改造計劃書.md §8) instead of hardcoded, so
+    # augmentation strategy is recorded in artifacts/config.json like every
+    # other part of this pipeline and can be varied per marker.
+    train_transform = build_train_transform(config.get("augmentation"))
+    val_transform = build_val_transform()
 
     # Dataset & Dataloaders
     train_ds, val_ds = build_train_dataset_from_config(full_config, train_transform, val_transform)

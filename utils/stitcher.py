@@ -3,8 +3,29 @@ from skimage.transform import resize
 import math
 import numba
 
+def _make_blend_weight(pd: int, ph: int, pw: int, min_weight: float = 0.1) -> np.ndarray:
+    """Per-voxel blend weight within a single patch: highest at the patch
+    center, ramping linearly down toward the edges (floored at min_weight,
+    never zero). Patch-boundary predictions generally have less surrounding
+    context than patch-center predictions, so giving every patch voxel the
+    same weight (the old `weight += 1` uniform accumulation) lets low-quality
+    boundary predictions pull the average down right at the patch grid
+    lines, producing visible seams (改造計劃書.md §3.6). Center-weighted
+    blending favors the better-supported prediction where patches overlap.
+    """
+    def axis_ramp(n: int) -> np.ndarray:
+        if n <= 1:
+            return np.ones(max(n, 1), dtype=np.float32)
+        idx = np.arange(n, dtype=np.float32)
+        center = (n - 1) / 2.0
+        ramp = 1.0 - np.abs((idx - center) / center)
+        return np.clip(ramp, min_weight, 1.0).astype(np.float32)
+
+    wz, wy, wx = axis_ramp(pd), axis_ramp(ph), axis_ramp(pw)
+    return (wz[:, None, None] * wy[None, :, None] * wx[None, None, :]).astype(np.float32)
+
 @numba.njit(fastmath=True)
-def _numba_stitch_loop(reconstruction, weight, patches, positions, pd, ph, pw):
+def _numba_stitch_loop(reconstruction, weight, patches, positions, patch_weight, pd, ph, pw):
     """
     Highly optimized sequential accumulation loop using Numba.
     Sequential is used to avoid race conditions on overlapping pixels.
@@ -13,29 +34,30 @@ def _numba_stitch_loop(reconstruction, weight, patches, positions, pd, ph, pw):
     rd, rh, rw = reconstruction.shape
     for i in range(len(patches)):
         z, y, x = positions[i]
-        
+
         # Calculate bounds in reconstruction space
         start_z = max(0, z)
         start_y = max(0, y)
         start_x = max(0, x)
-        
+
         end_z = min(rd, z + pd)
         end_y = min(rh, y + ph)
         end_x = min(rw, x + pw)
-        
+
         # Calculate bounds in patch space (compensating for negative offsets)
         p_start_z = max(0, -z)
         p_start_y = max(0, -y)
         p_start_x = max(0, -x)
-        
+
         target_d = end_z - start_z
         target_h = end_y - start_y
         target_w = end_x - start_x
-        
+
         if target_d > 0 and target_h > 0 and target_w > 0:
-            reconstruction[start_z:end_z, start_y:end_y, start_x:end_x] += \
-                patches[i][p_start_z:p_start_z+target_d, p_start_y:p_start_y+target_h, p_start_x:p_start_x+target_w]
-            weight[start_z:end_z, start_y:end_y, start_x:end_x] += 1
+            w_slice = patch_weight[p_start_z:p_start_z+target_d, p_start_y:p_start_y+target_h, p_start_x:p_start_x+target_w]
+            p_slice = patches[i][p_start_z:p_start_z+target_d, p_start_y:p_start_y+target_h, p_start_x:p_start_x+target_w]
+            reconstruction[start_z:end_z, start_y:end_y, start_x:end_x] += p_slice * w_slice
+            weight[start_z:end_z, start_y:end_y, start_x:end_x] += w_slice
 
 @numba.njit(parallel=True, nogil=True)
 def _numba_finalize_reconstruction(reconstruction, weight, prev_z_slices, logit_threshold):
@@ -97,7 +119,8 @@ def stitch_image(patches, positions, original_shape, patch_size, resize_factor=(
 
     # 3. XY Patch Accumulation (Sequential loop, but JIT-accelerated)
     positions_arr = np.array(positions, dtype=np.int64)
-    _numba_stitch_loop(reconstruction, weight, patches_to_stitch, positions_arr, pd, ph, pw)
+    patch_weight = _make_blend_weight(pd, ph, pw)
+    _numba_stitch_loop(reconstruction, weight, patches_to_stitch, positions_arr, patch_weight, pd, ph, pw)
 
     # 4. Finalize: Division, Z-blend, and Threshold (Fused Parallel Kernel)
     if threshold == 0.5:

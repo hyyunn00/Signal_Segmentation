@@ -246,7 +246,7 @@ def process_volume(volume_path: Path, output_dir: Path, output_name: str, model:
         stats_sample_rate=preprocess_config.get("sample_rate", 1.0),
         low_cut=preprocess_config.get("low_cut"),
         high_cut=preprocess_config.get("high_cut"),
-        compute_histogram=(method == "histogram")
+        compute_histogram=(method in ("histogram", "percentile"))
     )
     
     os.makedirs(output_dir, exist_ok=True)

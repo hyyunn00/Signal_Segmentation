@@ -55,7 +55,7 @@ def main():
         stats_sample_rate=preprocess_config.get("sample_rate", 1.0),
         low_cut=preprocess_config.get("low_cut"),
         high_cut=preprocess_config.get("high_cut"),
-        compute_histogram=(method == "histogram"),
+        compute_histogram=(method in ("histogram", "percentile")),
         hist_bins=preprocess_config.get("bins", 1024)
     )
 
@@ -73,6 +73,10 @@ def main():
         logger.info(f"Max:    {normalizer.max_v:.6f}")
         if normalizer.method == "min-max-gamma":
             logger.info(f"Gamma:  {normalizer.gamma:.4f}")
+    elif normalizer.method == "percentile":
+        logger.info(f"Percentiles: {normalizer.percentiles}")
+        logger.info(f"Low value:   {normalizer.percentile_low_v:.6f}")
+        logger.info(f"High value:  {normalizer.percentile_high_v:.6f}")
     
     if preprocess_config.get("low_cut") is not None:
         logger.info(f"Low Cut:  {preprocess_config.get('low_cut')}")
